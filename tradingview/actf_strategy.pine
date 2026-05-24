@@ -1,0 +1,87 @@
+//@version=5
+// ============================================================
+// ACTF Signal Strategy  (EMA Crossover + ATR-based SL/TP)
+// ============================================================
+// 이 스크립트를 TradingView 차트에 추가한 뒤,
+// Alert 조건에서 "ACTF Signal Strategy"를 선택하고
+// Webhook URL 에 서버 주소를 입력하면 자동으로 JSON 이 발송됩니다.
+// ============================================================
+strategy(
+    "ACTF Signal Strategy",
+    overlay       = true,
+    default_qty_type  = strategy.percent_of_equity,
+    default_qty_value = 100,
+    initial_capital   = 10000,
+    commission_type   = strategy.commission.percent,
+    commission_value  = 0.05
+)
+
+// ─── 입력값 ─────────────────────────────────────────────────
+var string GRP_SERVER  = "🌐 서버 설정"
+passphrase   = input.string("my_secret_token_123!",  "Webhook Passphrase", group=GRP_SERVER)
+symbol_ccxt  = input.string("BTC/USDT:USDT",         "Symbol (CCXT 형식)", group=GRP_SERVER)
+amount_usd   = input.float(50.0, "진입 증거금 (USD)",  group=GRP_SERVER, minval=1)
+
+var string GRP_IND = "📊 지표 설정"
+fast_len     = input.int(9,  "Fast EMA",   group=GRP_IND, minval=1)
+slow_len     = input.int(21, "Slow EMA",   group=GRP_IND, minval=1)
+atr_len      = input.int(14, "ATR Length", group=GRP_IND, minval=1)
+rsi_len      = input.int(14, "RSI Length", group=GRP_IND, minval=1)
+
+// ─── 지표 계산 ───────────────────────────────────────────────
+ema_fast = ta.ema(close, fast_len)
+ema_slow = ta.ema(close, slow_len)
+ema200   = ta.ema(close, 200)
+atr_val  = ta.atr(atr_len)
+rsi_val  = ta.rsi(close, rsi_len)
+
+// ─── 매매 신호 ───────────────────────────────────────────────
+buy_signal  = ta.crossover(ema_fast, ema_slow)
+sell_signal = ta.crossunder(ema_fast, ema_slow)
+
+// ─── 전략 진입/청산 (백테스트용) ────────────────────────────
+if buy_signal
+    strategy.entry("Long",  strategy.long)
+    strategy.close("Short")
+if sell_signal
+    strategy.entry("Short", strategy.short)
+    strategy.close("Long")
+
+// ─── 플롯 ────────────────────────────────────────────────────
+plot(ema_fast, "Fast EMA", color.new(color.blue,   0), 2)
+plot(ema_slow, "Slow EMA", color.new(color.orange, 0), 2)
+plot(ema200,   "EMA 200",  color.new(color.gray,  40), 1)
+
+plotshape(buy_signal,  "BUY",  shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(sell_signal, "SELL", shape.triangledown,  location.abovebar, color.red,   size=size.small)
+
+// ─── 웹훅 JSON 메시지 빌드 ───────────────────────────────────
+// TradingView Alert 설정 시 "메시지" 탭에 아래 내용을 그대로 붙여넣거나
+// 스크립트 내 alert() 호출로 자동 발송됩니다.
+
+_price = str.tostring(close,   "#.##")
+_atr   = str.tostring(atr_val, "#.##")
+_rsi   = str.tostring(rsi_val, "#.##")
+
+buy_json  = '{"passphrase":"' + passphrase + '",'  +
+            '"symbol":"'      + symbol_ccxt + '",' +
+            '"action":"BUY",' +
+            '"amount_usd":'   + str.tostring(amount_usd) + ',' +
+            '"current_price":' + _price + ','     +
+            '"atr":'           + _atr   + ','     +
+            '"rsi":'           + _rsi   + '}'
+
+sell_json = '{"passphrase":"' + passphrase + '",'  +
+            '"symbol":"'      + symbol_ccxt + '",' +
+            '"action":"SELL",' +
+            '"amount_usd":'   + str.tostring(amount_usd) + ',' +
+            '"current_price":' + _price + ','     +
+            '"atr":'           + _atr   + ','     +
+            '"rsi":'           + _rsi   + '}'
+
+// ─── 얼럿 발송 ───────────────────────────────────────────────
+if buy_signal
+    alert(buy_json, alert.freq_once_per_bar)
+
+if sell_signal
+    alert(sell_json, alert.freq_once_per_bar)
