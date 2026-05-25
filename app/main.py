@@ -15,6 +15,8 @@ from app.strategy import calculate_sl_tp_prices, should_update_trailing_stop
 from app.ai_filter import GeminiCryptoFilter
 from app.notifier import notifier
 from app.logger import trade_logger
+from app.market_mode import decide_market_mode
+from app.reversal_guard import ReversalGuard, SignalDecision
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -36,6 +38,7 @@ except Exception as e:
     exchange = None
 
 ai_filter = GeminiCryptoFilter()
+reversal_guard = ReversalGuard()
 
 # ── 심볼별 활성 포지션 추적 (단일 워커 전용) ─────────────────────────────────
 # {
@@ -165,6 +168,10 @@ class TradingViewSignal(BaseModel):
     current_price: float = Field(..., description="현재 실시간 체결가")
     atr: Optional[float] = Field(None, description="ATR 값 (SL/TP 계산용)")
     rsi: Optional[float] = Field(None, description="RSI (14)")
+    timeframe: Optional[str] = Field(None, description="TradingView signal timeframe")
+    strategy: Optional[str] = Field(None, description="TradingView strategy or indicator name")
+    signal_id: Optional[str] = Field(None, description="Optional idempotency key from TradingView")
+    market_mode: Optional[str] = Field(None, description="LONG_ONLY, SHORT_ONLY, BOTH, NO_TRADE, or AUTO")
     trend_ema200: Optional[str] = Field(None, description="EMA 200 대비 추세: 'UP' or 'DOWN'")
     fear_greed_index: Optional[int] = Field(None, description="공포/탐욕 지수")
     volatility: Optional[str] = Field(None, description="거래량 상태: 'HIGH' or 'LOW'")
@@ -203,8 +210,32 @@ def health_check():
         "ai_filter_active": ai_filter.is_active,
         "open_positions": len(active_orders),
         "active_symbols": list(active_orders.keys()),
+        "market_mode": settings.MARKET_MODE,
+        "reversal_pending": {
+            symbol: {
+                "action": pending.action,
+                "count": pending.count,
+                "first_seen": pending.first_seen.isoformat(),
+            }
+            for symbol, pending in reversal_guard.pending.items()
+        },
         "balance_usdt": round(balance_usdt, 2)
     }
+
+
+def close_symbol_position(symbol: str, reason: str):
+    log.info(f"[EXIT] {symbol} closing position: {reason}")
+    exchange.close_all_positions(symbol)
+    active_orders.pop(symbol, None)
+    reversal_guard.mark_exit(symbol)
+    notifier.notify_exit(symbol)
+    trade_logger.log_trade(
+        symbol=symbol,
+        action="CLOSE",
+        qty=0,
+        price=0,
+        status=f"CLOSED:{reason}"
+    )
 
 
 def process_trade_signal(signal: TradingViewSignal):
@@ -218,10 +249,7 @@ def process_trade_signal(signal: TradingViewSignal):
 
         # ── EXIT: 즉시 청산 ───────────────────────────────────────────────────
         if signal.action.upper() == "EXIT":
-            log.info(f"🛑 [EXIT] {signal.symbol} 포지션 청산 시작")
-            exchange.close_all_positions(signal.symbol)
-            active_orders.pop(signal.symbol, None)
-            notifier.notify_exit(signal.symbol)
+            close_symbol_position(signal.symbol, "explicit signal")
             return
 
         # ── BUY / SELL: 안전 장치 ────────────────────────────────────────────
@@ -233,6 +261,32 @@ def process_trade_signal(signal: TradingViewSignal):
         processing_symbols.add(signal.symbol)
 
         try:
+            market_mode = decide_market_mode(
+                signal_mode=signal.market_mode,
+                trend_ema200=signal.trend_ema200,
+                volatility=signal.volatility,
+            )
+            current_order = active_orders.get(signal.symbol)
+            current_action = current_order.get("action") if current_order else None
+            guard_result = reversal_guard.evaluate(
+                symbol=signal.symbol,
+                incoming_action=signal.action,
+                market_mode=market_mode,
+                current_action=current_action,
+            )
+            log.info(
+                f"[SIGNAL GATE] {signal.symbol} action={signal.action.upper()} "
+                f"mode={market_mode.value} decision={guard_result.decision.value} "
+                f"reason={guard_result.reason}"
+            )
+
+            if guard_result.decision == SignalDecision.IGNORE:
+                return
+
+            if guard_result.decision == SignalDecision.EXIT:
+                close_symbol_position(signal.symbol, guard_result.reason)
+                return
+
             # 1. 일일 손실 한도 (거래소 실현 손익 직접 조회)
             daily_pnl = exchange.get_daily_realized_pnl()
             if daily_pnl <= -abs(settings.MAX_DAILY_LOSS):
@@ -240,6 +294,13 @@ def process_trade_signal(signal: TradingViewSignal):
                 notifier.send_message(
                     f"🚨 *[거래 중단]* 일일 손실 한도 ${settings.MAX_DAILY_LOSS} 도달\n"
                     f"현재 손실: ${daily_pnl:.2f}"
+                )
+                return
+
+            if len(active_orders) >= settings.MAX_POSITIONS:
+                log.warning(
+                    f"⚠️ [포지션 제한] 활성 포지션 {len(active_orders)}개 → "
+                    f"최대 {settings.MAX_POSITIONS}개 초과 진입 차단"
                 )
                 return
 
@@ -322,7 +383,12 @@ def process_trade_signal(signal: TradingViewSignal):
                 "sl_price": sl_price,
                 "tp_price": tp_price,
                 "peak_price": signal.current_price,
+                "market_mode": market_mode.value,
+                "timeframe": signal.timeframe,
+                "strategy": signal.strategy,
+                "signal_id": signal.signal_id,
             }
+            reversal_guard.clear_pending(signal.symbol)
 
             # 9. 알림 및 CSV 기록
             notifier.notify_order_executed(

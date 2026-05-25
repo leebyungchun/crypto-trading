@@ -32,6 +32,15 @@ class Settings:
     ATR_MULTIPLIER_SL: float = float(os.getenv("CRYPTO_ATR_MULTIPLIER_SL", "1.5"))      # 손절폭 ATR 승수
     DEFAULT_SL_PCT: float = float(os.getenv("CRYPTO_DEFAULT_SL_PCT", "0.02"))        # ATR 실패 시 기본 손절폭 (2%)
     MAX_DAILY_LOSS: float = float(os.getenv("CRYPTO_MAX_DAILY_LOSS", "100.0"))        # 일일 최대 허용 손실 ($)
+    MAX_POSITIONS: int = int(os.getenv("CRYPTO_MAX_POSITIONS", "1"))
+
+    # ── TradingView 신호 게이트 / 훼이크 반전 방지 ──
+    MARKET_MODE: str = os.getenv("CRYPTO_MARKET_MODE", "AUTO").upper()
+    EXIT_ON_FIRST_COUNTER_SIGNAL: bool = os.getenv("CRYPTO_EXIT_ON_FIRST_COUNTER_SIGNAL", "false").lower() == "true"
+    IGNORE_COUNTER_SIGNAL_IN_TREND: bool = os.getenv("CRYPTO_IGNORE_COUNTER_SIGNAL_IN_TREND", "true").lower() == "true"
+    REVERSAL_CONFIRM_COUNT: int = int(os.getenv("CRYPTO_REVERSAL_CONFIRM_COUNT", "2"))
+    REVERSAL_CONFIRM_MINUTES: int = int(os.getenv("CRYPTO_REVERSAL_CONFIRM_MINUTES", "10"))
+    COOLDOWN_SECONDS: int = int(os.getenv("CRYPTO_COOLDOWN_SECONDS", "900"))
     
     # ── AI 필터 (Gemini) 설정 ──
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
