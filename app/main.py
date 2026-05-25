@@ -50,6 +50,8 @@ ai_filter = GeminiCryptoFilter()
 #   }
 # }
 active_orders: dict = {}
+# 현재 처리 중인 심볼 집합 — 동시 신호 Race Condition 방지 (CPython GIL 보장)
+processing_symbols: set = set()
 
 
 async def position_monitor():
@@ -224,104 +226,125 @@ def process_trade_signal(signal: TradingViewSignal):
 
         # ── BUY / SELL: 안전 장치 ────────────────────────────────────────────
 
-        # 1. 일일 손실 한도 (거래소 실현 손익 직접 조회)
-        daily_pnl = exchange.get_daily_realized_pnl()
-        if daily_pnl <= -abs(settings.MAX_DAILY_LOSS):
-            log.warning(f"🚨 [일일 한도] 실현 손실 ${daily_pnl:.2f} → 신규 진입 차단")
-            notifier.send_message(
-                f"🚨 *[거래 중단]* 일일 손실 한도 ${settings.MAX_DAILY_LOSS} 도달\n"
-                f"현재 손실: ${daily_pnl:.2f}"
-            )
+        # Race Condition 방지: 동일 심볼 동시 신호 차단 (CPython GIL 보장)
+        if signal.symbol in processing_symbols:
+            log.warning(f"⚠️ [{signal.symbol}] 이미 처리 중인 신호 — 중복 실행 차단")
             return
+        processing_symbols.add(signal.symbol)
 
-        # 2. 중복 포지션 체크
         try:
-            positions = exchange.client.fetch_positions([signal.symbol])
-            for pos in positions:
-                if float(pos.get("contracts", 0)) != 0:
-                    log.warning(f"⚠️ [중복 차단] {signal.symbol} 포지션 이미 존재.")
-                    return
-        except Exception as e:
-            log.error(f"포지션 조회 오류 (진입 중단): {e}")
-            return
+            # 1. 일일 손실 한도 (거래소 실현 손익 직접 조회)
+            daily_pnl = exchange.get_daily_realized_pnl()
+            if daily_pnl <= -abs(settings.MAX_DAILY_LOSS):
+                log.warning(f"🚨 [일일 한도] 실현 손실 ${daily_pnl:.2f} → 신규 진입 차단")
+                notifier.send_message(
+                    f"🚨 *[거래 중단]* 일일 손실 한도 ${settings.MAX_DAILY_LOSS} 도달\n"
+                    f"현재 손실: ${daily_pnl:.2f}"
+                )
+                return
 
-        # 3. AI 필터
-        verdict = ai_filter.analyze_signal(
-            symbol=signal.symbol,
-            action=signal.action,
-            price=signal.current_price,
-            market_context={
-                "rsi": signal.rsi,
-                "trend_ema200": signal.trend_ema200,
-                "fear_greed_index": signal.fear_greed_index,
-                "volatility": signal.volatility,
-                "current_atr": signal.atr
+            # 2. 중복 포지션 체크
+            try:
+                positions = exchange.client.fetch_positions([signal.symbol])
+                for pos in positions:
+                    if float(pos.get("contracts", 0)) != 0:
+                        log.warning(f"⚠️ [중복 차단] {signal.symbol} 포지션 이미 존재.")
+                        return
+            except Exception as e:
+                log.error(f"포지션 조회 오류 (진입 중단): {e}")
+                return
+
+            # 3. AI 필터
+            verdict = ai_filter.analyze_signal(
+                symbol=signal.symbol,
+                action=signal.action,
+                price=signal.current_price,
+                market_context={
+                    "rsi": signal.rsi,
+                    "trend_ema200": signal.trend_ema200,
+                    "fear_greed_index": signal.fear_greed_index,
+                    "volatility": signal.volatility,
+                    "current_atr": signal.atr
+                }
+            )
+            if verdict.decision != "ALLOW":
+                log.warning(f"🛡️ [AI {verdict.decision}] {signal.symbol} | {verdict.reason}")
+                notifier.notify_ai_filter(signal.symbol, signal.action, verdict.decision, verdict.reason)
+                return
+            log.info(f"🟢 [AI APPROVED] {verdict.reason}")
+
+            # 4. SL/TP 계산
+            sl_price, tp_price = calculate_sl_tp_prices(
+                entry_price=signal.current_price,
+                action=signal.action,
+                atr=signal.atr
+            )
+
+            # 5. 수량 계산 — 거래소 심볼별 stepSize 정밀도 적용
+            raw_qty = (signal.amount_usd * settings.LEVERAGE) / signal.current_price
+            order_qty = float(exchange.client.amount_to_precision(signal.symbol, raw_qty))
+
+            # 6. 시장가 진입
+            side = "buy" if signal.action.upper() == "BUY" else "sell"
+            exchange.execute_order(symbol=signal.symbol, side=side, amount=order_qty)
+            log.info(
+                f"💰 [체결] {signal.symbol} {signal.action.upper()} {order_qty} Qty\n"
+                f"   └─ 진입가: {signal.current_price:.2f} | SL: {sl_price:.2f} | TP: {tp_price:.2f}"
+            )
+
+            # 7. SL/TP 예약 주문 — 실패 시 고아 포지션 자동 청산
+            try:
+                sl_order, tp_order = exchange.set_sl_tp_orders(
+                    symbol=signal.symbol,
+                    amount=order_qty,
+                    sl_price=sl_price,
+                    tp_price=tp_price,
+                    position_side=signal.action.upper()
+                )
+            except Exception as sl_tp_err:
+                log.critical(f"🚨 [{signal.symbol}] SL/TP 설정 실패 → 즉시 자동 청산 시도: {sl_tp_err}")
+                notifier.send_message(f"🚨 *[긴급]* {signal.symbol} SL/TP 설정 실패! 자동 청산 중...")
+                try:
+                    exchange.close_all_positions(signal.symbol)
+                    notifier.send_message(f"⚠️ *[자동 청산 완료]* {signal.symbol} 고아 포지션 정리됨")
+                except Exception as close_err:
+                    log.critical(f"🚨🚨 [{signal.symbol}] 자동 청산마저 실패: {close_err}")
+                    notifier.send_message(f"🚨🚨 *[수동 개입 필요!]* {signal.symbol} 고아 포지션 존재 — 즉시 확인!")
+                return
+
+            # 8. 트레일링 스탑 + 모니터용 포지션 추적 정보 저장
+            active_orders[signal.symbol] = {
+                "sl_id": sl_order.get("id"),
+                "tp_id": tp_order.get("id"),
+                "action": signal.action.upper(),
+                "qty": order_qty,
+                "entry_price": signal.current_price,
+                "sl_price": sl_price,
+                "tp_price": tp_price,
+                "peak_price": signal.current_price,
             }
-        )
-        if verdict.decision != "ALLOW":
-            log.warning(f"🛡️ [AI {verdict.decision}] {signal.symbol} | {verdict.reason}")
-            notifier.notify_ai_filter(signal.symbol, signal.action, verdict.decision, verdict.reason)
-            return
-        log.info(f"🟢 [AI APPROVED] {verdict.reason}")
 
-        # 4. SL/TP 계산
-        sl_price, tp_price = calculate_sl_tp_prices(
-            entry_price=signal.current_price,
-            action=signal.action,
-            atr=signal.atr
-        )
+            # 9. 알림 및 CSV 기록
+            notifier.notify_order_executed(
+                symbol=signal.symbol,
+                action=signal.action,
+                qty=order_qty,
+                entry_price=signal.current_price,
+                sl=sl_price,
+                tp=tp_price
+            )
+            trade_logger.log_trade(
+                symbol=signal.symbol,
+                action=signal.action.upper(),
+                qty=order_qty,
+                price=signal.current_price,
+                sl=sl_price,
+                tp=tp_price,
+                status="OPEN"
+            )
 
-        # 5. 수량 계산 — 거래소 심볼별 stepSize 정밀도 적용
-        raw_qty = (signal.amount_usd * settings.LEVERAGE) / signal.current_price
-        order_qty = float(exchange.client.amount_to_precision(signal.symbol, raw_qty))
-
-        # 6. 시장가 진입
-        side = "buy" if signal.action.upper() == "BUY" else "sell"
-        exchange.execute_order(symbol=signal.symbol, side=side, amount=order_qty)
-        log.info(
-            f"💰 [체결] {signal.symbol} {signal.action.upper()} {order_qty} Qty\n"
-            f"   └─ 진입가: {signal.current_price:.2f} | SL: {sl_price:.2f} | TP: {tp_price:.2f}"
-        )
-
-        # 7. SL/TP 예약 주문
-        sl_order, tp_order = exchange.set_sl_tp_orders(
-            symbol=signal.symbol,
-            amount=order_qty,
-            sl_price=sl_price,
-            tp_price=tp_price,
-            position_side=signal.action.upper()
-        )
-
-        # 8. 트레일링 스탑 + 모니터용 포지션 추적 정보 저장
-        active_orders[signal.symbol] = {
-            "sl_id": sl_order.get("id"),
-            "tp_id": tp_order.get("id"),
-            "action": signal.action.upper(),
-            "qty": order_qty,
-            "entry_price": signal.current_price,
-            "sl_price": sl_price,
-            "tp_price": tp_price,
-            "peak_price": signal.current_price,
-        }
-
-        # 9. 알림 및 CSV 기록
-        notifier.notify_order_executed(
-            symbol=signal.symbol,
-            action=signal.action,
-            qty=order_qty,
-            entry_price=signal.current_price,
-            sl=sl_price,
-            tp=tp_price
-        )
-        trade_logger.log_trade(
-            symbol=signal.symbol,
-            action=signal.action.upper(),
-            qty=order_qty,
-            price=signal.current_price,
-            sl=sl_price,
-            tp=tp_price,
-            status="OPEN"
-        )
+        finally:
+            processing_symbols.discard(signal.symbol)
 
     except Exception as e:
         log.error(f"🚨 [{signal.symbol}] 프로세스 오류: {e}")
